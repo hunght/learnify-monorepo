@@ -2,8 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-cd "$REPO_ROOT"
+MOBILE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${MOBILE_ROOT}/../.." && pwd)"
+cd "$MOBILE_ROOT"
 
 BUMP_TYPE="patch"
 TARGET_VERSION=""
@@ -196,7 +197,7 @@ NODE
 )
 EOF_VERSION
 
-TAG="v${NEW_VERSION}"
+TAG="mobile-v${NEW_VERSION}"
 
 if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
   echo "Tag '${TAG}' already exists locally." >&2

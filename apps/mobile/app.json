@@ -70,7 +70,7 @@
       },
       "apkUpdate": {
         "manifestUrl": "",
-        "githubRepo": "hunght/learnify-mobile",
+        "githubRepo": "hunght/learnify-monorepo",
         "checkOnLaunch": true,
         "requestTimeoutMs": 10000
       }
