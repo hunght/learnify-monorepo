@@ -75,12 +75,15 @@ jobs:
           mkdir -p dist/data
 
       - name: Install the Apple certificate
-        if: ${{ secrets.BUILD_CERTIFICATE_BASE64 != '' }}
         env:
           BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
           P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
+          if [ -z "${BUILD_CERTIFICATE_BASE64:-}" ]; then
+            echo "⚠️  No Apple certificate configured — skipping code signing setup"
+            exit 0
+          fi
           set -euo pipefail
           CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
@@ -132,9 +135,12 @@ jobs:
           npm run publish -- --platform=darwin --arch=$ARCH
 
       - name: Clean up keychain
-        if: ${{ secrets.BUILD_CERTIFICATE_BASE64 != '' }}
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
         run: |
-          security delete-keychain $RUNNER_TEMP/app-signing.keychain-db
+          if [ -n "${BUILD_CERTIFICATE_BASE64:-}" ]; then
+            security delete-keychain $RUNNER_TEMP/app-signing.keychain-db || true
+          fi
 
   cleanup-release-assets:
     needs: release-macos
