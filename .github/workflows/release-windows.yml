@@ -42,7 +42,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: apps/desktop
-        run: npm ci
+        run: npm install
 
       - name: Create data directories
         working-directory: apps/desktop
