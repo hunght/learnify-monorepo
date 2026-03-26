@@ -1,0 +1,58 @@
+name: Release Linux
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Determine release metadata
+        id: release_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF_NAME:-${GITHUB_REF##*/}}"
+          TAG_CONTENT=$(git for-each-ref "refs/tags/${TAG_NAME}" --format='%(contents)' || true)
+          DRAFT=$(printf '%s\n' "$TAG_CONTENT" | awk -F= '/^draft=/{print tolower($2); exit}')
+          PRERELEASE=$(printf '%s\n' "$TAG_CONTENT" | awk -F= '/^prerelease=/{print tolower($2); exit}')
+          if [[ "$DRAFT" != "true" ]]; then DRAFT="false"; fi
+          if [[ "$PRERELEASE" != "true" ]]; then PRERELEASE="false"; fi
+          {
+            echo "draft=${DRAFT}"
+            echo "prerelease=${PRERELEASE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Build app
+        working-directory: apps/desktop
+        env:
+          NODE_ENV: production
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VITE_PUBLIC_POSTHOG_KEY: ${{ secrets.VITE_PUBLIC_POSTHOG_KEY }}
+          VITE_PUBLIC_POSTHOG_HOST: ${{ secrets.VITE_PUBLIC_POSTHOG_HOST }}
+          RELEASE_DRAFT: ${{ steps.release_meta.outputs.draft }}
+          RELEASE_PRERELEASE: ${{ steps.release_meta.outputs.prerelease }}
+        run: npm run publish

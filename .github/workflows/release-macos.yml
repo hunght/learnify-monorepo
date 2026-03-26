@@ -1,0 +1,161 @@
+name: Release macOS
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release-macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Determine release metadata
+        id: release_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF_NAME:-${GITHUB_REF##*/}}"
+          TAG_CONTENT=$(git for-each-ref "refs/tags/${TAG_NAME}" --format='%(contents)' || true)
+          DRAFT=$(printf '%s\n' "$TAG_CONTENT" | awk -F= '/^draft=/{print tolower($2); exit}')
+          PRERELEASE=$(printf '%s\n' "$TAG_CONTENT" | awk -F= '/^prerelease=/{print tolower($2); exit}')
+          if [[ "$DRAFT" != "true" ]]; then DRAFT="false"; fi
+          if [[ "$PRERELEASE" != "true" ]]; then PRERELEASE="false"; fi
+          {
+            echo "draft=${DRAFT}"
+            echo "prerelease=${PRERELEASE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Install Rosetta 2 (for x64 builds)
+        if: matrix.arch == 'x64'
+        run: sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Install architecture-specific dependencies
+        working-directory: apps/desktop
+        run: |
+          set -euo pipefail
+          ARCH="${{ matrix.arch }}"
+
+          if [ "$ARCH" == "x64" ]; then
+            npm install --no-save --force --platform=darwin --arch=x64 @libsql/darwin-x64
+          elif [ "$ARCH" == "arm64" ]; then
+            npm install --no-save --force --platform=darwin --arch=arm64 @libsql/darwin-arm64
+          else
+            echo "Unsupported architecture: $ARCH"
+            exit 1
+          fi
+
+      - name: Create data directories
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          mkdir -p data
+          mkdir -p out/make/data
+          mkdir -p release/data
+          mkdir -p dist/data
+
+      - name: Install the Apple certificate
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode --output $CERTIFICATE_PATH
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security default-keychain -s $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH $(security list-keychains -d user | tr -d '"')
+
+          echo "Verifying certificate..."
+          security find-identity -v
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+      - name: Build for macOS (${{ matrix.arch }})
+        working-directory: apps/desktop
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          NODE_ENV: production
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARCH: ${{ matrix.arch }}
+          npm_config_arch: ${{ matrix.arch }}
+          npm_config_target_arch: ${{ matrix.arch }}
+          npm_config_target_platform: darwin
+          VITE_PUBLIC_POSTHOG_KEY: ${{ secrets.VITE_PUBLIC_POSTHOG_KEY }}
+          VITE_PUBLIC_POSTHOG_HOST: ${{ secrets.VITE_PUBLIC_POSTHOG_HOST }}
+          RELEASE_DRAFT: ${{ steps.release_meta.outputs.draft }}
+          RELEASE_PRERELEASE: ${{ steps.release_meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          echo "Building for architecture: $ARCH"
+          if [ ! -f "entitlements.plist" ]; then
+            echo "entitlements.plist not found"
+            exit 1
+          fi
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $RUNNER_TEMP/app-signing.keychain-db
+          npm run publish -- --platform=darwin --arch=$ARCH
+
+      - name: Clean up keychain
+        run: |
+          security delete-keychain $RUNNER_TEMP/app-signing.keychain-db
+
+  cleanup-release-assets:
+    needs: release-macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Remove unused release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(gh release view "$TAG_NAME" --json assets --jq '.assets[].name')
+
+          for asset in "${assets[@]}"; do
+            case "$asset" in
+              *.nupkg|RELEASES)
+                echo "Deleting unused asset: $asset"
+                gh release delete-asset "$TAG_NAME" "$asset" --yes
+                ;;
+              *)
+                echo "Keeping asset: $asset"
+                ;;
+            esac
+          done
