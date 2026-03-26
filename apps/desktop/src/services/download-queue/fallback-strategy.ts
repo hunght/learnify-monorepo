@@ -1,0 +1,350 @@
+import { normalizeVideoDownloadQuality, type DownloadQuality } from "@/lib/types/user-preferences";
+import { logger } from "@/helpers/logger";
+
+/**
+ * Player clients in fallback order (most reliable first based on testing)
+ * - default: Lets yt-dlp choose the best extraction path (best quality when JS challenges can be solved)
+ * - android: Reliable fallback when default/web extraction is degraded
+ * - ios: Good alternative for restricted content
+ * - tv: Simple client, often works when others fail
+ * - mweb: Mobile web client
+ * - web_safari: Safari web client (avoids some restrictions)
+ * - web: Standard web client (last resort, may hit SABR issues)
+ */
+export const PLAYER_CLIENTS = [
+  "default",
+  "android",
+  "ios",
+  "tv",
+  "mweb",
+  "web_safari",
+  "web",
+] as const;
+
+export type PlayerClient = (typeof PLAYER_CLIENTS)[number];
+
+/**
+ * Format strategies from most specific to most permissive
+ */
+export const FORMAT_STRATEGIES = [
+  "quality", // User's preferred quality, WebM-first
+  "quality_any", // User's preferred quality, any format
+  "fallback", // Reliability fallback while keeping HD floor
+  "best", // Just get the best available
+  "hls", // HLS streaming fallback (for SABR-affected formats)
+] as const;
+
+export type FormatStrategy = (typeof FORMAT_STRATEGIES)[number];
+
+/**
+ * Fallback state tracking
+ */
+export interface FallbackState {
+  playerClientIndex: number;
+  formatStrategyIndex: number;
+  fallbackAttempts: number;
+  maxFallbackAttempts: number;
+}
+
+/**
+ * Error types that trigger specific fallback actions
+ */
+type FallbackAction = "next_client" | "next_format" | "delay_retry" | "no_fallback";
+
+/**
+ * Get player client by index
+ */
+export const getPlayerClient = (index: number): PlayerClient => {
+  const clampedIndex = Math.max(0, Math.min(index, PLAYER_CLIENTS.length - 1));
+  return PLAYER_CLIENTS[clampedIndex];
+};
+
+/**
+ * Get format string based on strategy and quality preference
+ */
+export const getFormatString = (strategy: FormatStrategy, quality: DownloadQuality): string => {
+  const normalizedQuality = normalizeVideoDownloadQuality(quality);
+  const heightMap: Record<DownloadQuality, number> = {
+    "360p": 360,
+    "480p": 480,
+    "720p": 720,
+    "1080p": 1080,
+  };
+  const maxHeight = heightMap[normalizedQuality];
+
+  switch (strategy) {
+    case "quality":
+      // User's preferred quality, WebM-first with progressive fallback
+      return `best[height<=${maxHeight}][ext=webm]/bestvideo[height<=${maxHeight}][ext=webm]+bestaudio[ext=webm]/best[height<=${Math.min(maxHeight, 720)}][ext=webm]/best[height<=${Math.min(maxHeight, 480)}][ext=webm]/best[height<=${maxHeight}][ext=mp4][vcodec^=avc1]/bestvideo[height<=${maxHeight}][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=${maxHeight}]`;
+
+    case "quality_any":
+      // User's preferred quality, any format (no codec restrictions)
+      return `best[height<=${maxHeight}]/bestvideo[height<=${maxHeight}]+bestaudio/best[height<=${maxHeight}]`;
+
+    case "fallback":
+      // Reliability fallback still keeps HD video floor.
+      return `best[height<=720]/bestvideo[height<=720]+bestaudio/best[height<=720]`;
+
+    case "best":
+      // Just get anything that works
+      return `bv*+ba/b/best`;
+
+    case "hls":
+      // HLS streaming fallback (bypasses SABR-affected formats)
+      return `bv*[protocol=m3u8]+ba[protocol=m3u8]/b[protocol=m3u8]/best`;
+
+    default:
+      // Fallback to quality strategy
+      return getFormatString("quality", quality);
+  }
+};
+
+/**
+ * Determine fallback action based on error message and type
+ */
+const determineFallbackAction = (errorMessage: string, errorType: string): FallbackAction => {
+  const lowerMessage = errorMessage.toLowerCase();
+  const lowerType = errorType.toLowerCase();
+
+  // Don't retry non-recoverable content states.
+  if (
+    lowerMessage.includes("video unavailable") ||
+    lowerMessage.includes("private video") ||
+    lowerMessage.includes("this video is unavailable") ||
+    lowerMessage.includes("copyright") ||
+    lowerMessage.includes("requested video is unavailable")
+  ) {
+    return "no_fallback";
+  }
+
+  // No fallback for auth-required errors
+  if (
+    lowerType === "spawn_error" ||
+    lowerMessage.includes("yt-dlp binary is not available") ||
+    lowerMessage.includes("yt-dlp binary not installed") ||
+    lowerMessage.includes("sign-in") ||
+    lowerMessage.includes("sign in") ||
+    lowerMessage.includes("login") ||
+    lowerMessage.includes("age-restricted") ||
+    lowerType === "auth_required"
+  ) {
+    return "no_fallback";
+  }
+
+  // If ffmpeg is missing, prefer switching format strategy to avoid merge requirements.
+  if (lowerType === "ffmpeg_missing" || lowerMessage.includes("ffmpeg")) {
+    return "next_format";
+  }
+
+  // If yt-dlp cannot solve YouTube's JS challenges for the default client, fall back.
+  if (lowerType === "js_runtime_missing" || lowerMessage.includes("javascript runtime")) {
+    return "next_client";
+  }
+
+  // Download succeeded but did not meet the requested quality target.
+  if (lowerType === "quality_too_low") {
+    return "next_client";
+  }
+
+  // Transient network failures should retry same config after delay.
+  if (
+    lowerMessage.includes("timed out") ||
+    lowerMessage.includes("connection reset") ||
+    lowerMessage.includes("temporary failure in name resolution") ||
+    lowerMessage.includes("name or service not known") ||
+    lowerMessage.includes("nodename nor servname")
+  ) {
+    return "delay_retry";
+  }
+
+  // Player client issues - try next client
+  if (
+    lowerMessage.includes("n challenge") ||
+    lowerMessage.includes("nsig") ||
+    lowerMessage.includes("sabr") ||
+    lowerMessage.includes("http error 403") ||
+    lowerType === "http_403_forbidden"
+  ) {
+    return "next_client";
+  }
+
+  // Format availability issues - try simpler format
+  if (
+    lowerMessage.includes("format not available") ||
+    lowerMessage.includes("requested format") ||
+    lowerMessage.includes("no video formats") ||
+    lowerMessage.includes("unable to download") ||
+    lowerMessage.includes("format is not available")
+  ) {
+    return "next_format";
+  }
+
+  // Rate limiting - delay and retry same config
+  if (lowerMessage.includes("http error 429") || lowerType === "http_429_rate_limited") {
+    return "delay_retry";
+  }
+
+  // Generic HTTP errors - try next client
+  if (lowerMessage.includes("http error") || lowerType.includes("http_error")) {
+    return "next_client";
+  }
+
+  // Default: try next format (less disruptive than changing client)
+  return "next_format";
+};
+
+/**
+ * Check if error is eligible for automatic fallback
+ */
+export const shouldAutoFallback = (errorMessage: string, errorType: string): boolean => {
+  const action = determineFallbackAction(errorMessage, errorType);
+  return action !== "no_fallback";
+};
+
+/**
+ * Get next fallback state based on current state and error type
+ * Returns null if no more fallbacks are available
+ */
+export const getNextFallbackState = (
+  current: FallbackState,
+  errorMessage: string,
+  errorType: string
+): FallbackState | null => {
+  // Check if we've exceeded max attempts
+  if (current.fallbackAttempts >= current.maxFallbackAttempts) {
+    logger.debug("[fallback-strategy] Max fallback attempts reached", {
+      attempts: current.fallbackAttempts,
+      max: current.maxFallbackAttempts,
+    });
+    return null;
+  }
+
+  const action = determineFallbackAction(errorMessage, errorType);
+
+  if (action === "no_fallback") {
+    logger.debug("[fallback-strategy] Error not eligible for fallback", {
+      errorMessage,
+      errorType,
+    });
+    return null;
+  }
+
+  let nextClientIndex = current.playerClientIndex;
+  let nextFormatIndex = current.formatStrategyIndex;
+
+  if (action === "next_client") {
+    // Try next player client, reset format strategy
+    nextClientIndex = current.playerClientIndex + 1;
+    nextFormatIndex = 0; // Reset format strategy for new client
+
+    // If we've exhausted all clients, cycle back to first client with next format
+    if (nextClientIndex >= PLAYER_CLIENTS.length) {
+      nextClientIndex = 0;
+      nextFormatIndex = current.formatStrategyIndex + 1;
+
+      // If we've also exhausted all formats, no more fallbacks
+      if (nextFormatIndex >= FORMAT_STRATEGIES.length) {
+        logger.debug("[fallback-strategy] All player clients and formats exhausted");
+        return null;
+      }
+    }
+  } else if (action === "next_format") {
+    // Try next format strategy with same client
+    nextFormatIndex = current.formatStrategyIndex + 1;
+
+    // If we've exhausted formats for this client, try next client
+    if (nextFormatIndex >= FORMAT_STRATEGIES.length) {
+      nextClientIndex = current.playerClientIndex + 1;
+      nextFormatIndex = 0;
+
+      // If we've exhausted all clients too, no more fallbacks
+      if (nextClientIndex >= PLAYER_CLIENTS.length) {
+        logger.debug("[fallback-strategy] All formats and player clients exhausted");
+        return null;
+      }
+    }
+  } else if (action === "delay_retry") {
+    // Retry same client/format after delay (managed by queue-manager scheduling).
+    nextClientIndex = current.playerClientIndex;
+    nextFormatIndex = current.formatStrategyIndex;
+  }
+
+  const nextState: FallbackState = {
+    playerClientIndex: nextClientIndex,
+    formatStrategyIndex: nextFormatIndex,
+    fallbackAttempts: current.fallbackAttempts + 1,
+    maxFallbackAttempts: current.maxFallbackAttempts,
+  };
+
+  logger.info("[fallback-strategy] Advancing to next fallback", {
+    previousClient: PLAYER_CLIENTS[current.playerClientIndex],
+    previousFormat: FORMAT_STRATEGIES[current.formatStrategyIndex],
+    nextClient: PLAYER_CLIENTS[nextClientIndex],
+    nextFormat: FORMAT_STRATEGIES[nextFormatIndex],
+    attempt: nextState.fallbackAttempts,
+    maxAttempts: nextState.maxFallbackAttempts,
+    action,
+  });
+
+  return nextState;
+};
+
+/**
+ * Create initial fallback state for a new download
+ */
+export const createInitialFallbackState = (maxAttempts = 10): FallbackState => ({
+  playerClientIndex: 0,
+  formatStrategyIndex: 0,
+  fallbackAttempts: 0,
+  maxFallbackAttempts: maxAttempts,
+});
+
+export const createDefaultFallbackState = (): FallbackState => {
+  const exhaustiveCombinations = PLAYER_CLIENTS.length * FORMAT_STRATEGIES.length;
+  return createInitialFallbackState(exhaustiveCombinations);
+};
+
+export const getFallbackRetryDelayMs = (
+  errorMessage: string,
+  errorType: string,
+  fallbackAttempt: number
+): number => {
+  const lowerMessage = errorMessage.toLowerCase();
+  const lowerType = errorType.toLowerCase();
+  const baseDelay = 3_000;
+  const cappedAttempt = Math.min(Math.max(fallbackAttempt, 1), 6);
+
+  if (
+    lowerType === "http_429_rate_limited" ||
+    lowerMessage.includes("http error 429") ||
+    lowerMessage.includes("too many requests")
+  ) {
+    return Math.min(baseDelay * 2 ** cappedAttempt, 120_000);
+  }
+
+  if (
+    lowerMessage.includes("timed out") ||
+    lowerMessage.includes("connection reset") ||
+    lowerMessage.includes("temporary failure in name resolution") ||
+    lowerMessage.includes("name or service not known") ||
+    lowerMessage.includes("nodename nor servname")
+  ) {
+    return Math.min(baseDelay * cappedAttempt, 30_000);
+  }
+
+  return 0;
+};
+
+/**
+ * Get human-readable fallback status string for UI display
+ */
+export const getFallbackStatusString = (state: FallbackState): string | null => {
+  if (state.fallbackAttempts === 0) {
+    return null; // No fallback yet, don't show anything
+  }
+
+  const client = PLAYER_CLIENTS[state.playerClientIndex];
+  const format = FORMAT_STRATEGIES[state.formatStrategyIndex];
+
+  return `Fallback ${state.fallbackAttempts}/${state.maxFallbackAttempts}: ${client} client, ${format} format`;
+};

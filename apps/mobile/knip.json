@@ -1,0 +1,24 @@
+{
+  "$schema": "https://unpkg.com/knip@latest/schema.json",
+  "entry": [
+    "app/**/*.tsx",
+    "components/**/*.tsx",
+    "hooks/**/*.ts",
+    "services/**/*.ts",
+    "stores/**/*.ts",
+    "db/**/*.ts"
+  ],
+  "project": ["**/*.{ts,tsx}", "!.expo/**", "!android/**"],
+  "ignore": [
+    "**/__tests__/**",
+    "**/__mocks__/**",
+    ".expo/**",
+    "android/**",
+    "metro.config.js"
+  ],
+  "ignoreDependencies": ["expo-updates", "expo-system-ui"],
+  "ignoreBinaries": ["expo-doctor", "eas", "eslint"],
+  "typescript": {
+    "config": ["tsconfig.json"]
+  }
+}

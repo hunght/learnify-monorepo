@@ -1,0 +1,17 @@
+{
+  "name": "learnify-monorepo",
+  "private": true,
+  "scripts": {
+    "desktop:install": "npm ci --prefix apps/desktop",
+    "desktop:dev": "npm run dev --prefix apps/desktop",
+    "desktop:type-check": "npm run type-check --prefix apps/desktop",
+    "desktop:package": "npm run package --prefix apps/desktop",
+    "desktop:test:e2e:smoke": "sh -lc 'cd apps/desktop && npx playwright test src/tests/e2e/core-functionality.spec.ts --grep \"App Launch and Basic Navigation\"'",
+    "mobile:install": "npm ci --prefix apps/mobile",
+    "mobile:start": "npm run start --prefix apps/mobile",
+    "mobile:start:mobile": "npm run start:mobile --prefix apps/mobile",
+    "mobile:start:tv": "npm run start:tv --prefix apps/mobile",
+    "mobile:type-check": "npm run type-check --prefix apps/mobile",
+    "mobile:android": "npm run android --prefix apps/mobile"
+  }
+}

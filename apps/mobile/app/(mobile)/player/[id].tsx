@@ -1,0 +1,1292 @@
+import {
+  useEffect,
+  useRef,
+  useState,
+  useCallback,
+  useMemo } from "react";
+import {
+  View,
+  Text,
+  StyleSheet,
+  FlatList,
+  ScrollView,
+  Dimensions,
+  ActivityIndicator,
+  Alert,
+  Modal,
+  Pressable,
+  type ViewToken,
+} from "react-native";
+import { useLocalSearchParams, router } from "expo-router";
+import { useVideoPlayer, VideoView } from "expo-video";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useLibraryStore } from "../../../stores/library";
+import { usePlaybackStore } from "../../../stores/playback";
+import { useConnectionStore } from "../../../stores/connection";
+import { useSettingsStore } from "../../../stores/settings";
+import { api } from "../../../services/api";
+import { getVideoLocalPath } from "../../../services/downloader";
+import * as wordsRepo from "../../../db/repositories/words";
+import * as watchHistoryRepo from "../../../db/repositories/watchHistory";
+import * as videoRepo from "../../../db/repositories/videos";
+import type { TranscriptSegment, Transcript, TranslateResult } from "../../../types";
+
+const { width: SCREEN_WIDTH } = Dimensions.get("window");
+const VIDEO_HEIGHT = (SCREEN_WIDTH * 9) / 16;
+const SEGMENT_HEIGHT = 56; // Approximate height of each segment row
+const AUTO_SCROLL_THROTTLE_MS = 900;
+const USER_SCROLL_HOLD_MS = 1800;
+
+function parseTimestampToSeconds(timestamp: string): number | null {
+  const hmsMatch = timestamp.match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
+  if (hmsMatch) {
+    const hours = parseInt(hmsMatch[1], 10);
+    const minutes = parseInt(hmsMatch[2], 10);
+    const seconds = parseInt(hmsMatch[3], 10);
+    return hours * 3600 + minutes * 60 + seconds;
+  }
+
+  const msMatch = timestamp.match(/^(\d{1,2}):(\d{2})$/);
+  if (msMatch) {
+    const minutes = parseInt(msMatch[1], 10);
+    const seconds = parseInt(msMatch[2], 10);
+    return minutes * 60 + seconds;
+  }
+
+  return null;
+}
+
+function renderDescriptionWithTimestamps(
+  description: string,
+  onSeek: (seconds: number) => void
+): React.ReactNode {
+  const timestampRegex = /\b(\d{1,2}:\d{2}(?::\d{2})?)\b/g;
+  const parts = description.split(timestampRegex);
+
+  return parts.map((part, index) => {
+    if (part && /^\d{1,2}:\d{2}(?::\d{2})?$/.test(part)) {
+      const seconds = parseTimestampToSeconds(part);
+      if (seconds !== null) {
+        return (
+          <Text key={`ts-${index}`} style={styles.descriptionTimestamp} onPress={() => onSeek(seconds)}>
+            {part}
+          </Text>
+        );
+      }
+    }
+    return part;
+  });
+}
+
+export default function PlayerScreen() {
+  const { id, start } = useLocalSearchParams<{ id: string; start?: string }>();
+  const libraryVideo = useLibraryStore((state) =>
+    state.videos.find((v) => v.id === id)
+  );
+  const [currentTime, setCurrentTime] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [streamingTranscript, setStreamingTranscript] =
+    useState<Transcript | null>(null);
+  const [isLoadingTranscript, setIsLoadingTranscript] = useState(false);
+  const [isDownloadingTranscript, setIsDownloadingTranscript] = useState(false);
+  const transcriptListRef = useRef<FlatList>(null);
+  const visibleTranscriptRangeRef = useRef<{ first: number; last: number }>({
+    first: -1,
+    last: -1,
+  });
+  const lastAutoScrollAtRef = useRef(0);
+  const lastAutoScrollIndexRef = useRef(-1);
+  const userInteractingUntilRef = useRef(0);
+  const insets = useSafeAreaInsets();
+  const watchAccumulatorRef = useRef(0);
+  const lastPlaybackTimeRef = useRef(0);
+  const lastPositionRef = useRef(0);
+  const lastPersistedAtRef = useRef(0);
+  const isPlayingRef = useRef(false);
+  const initialSeekDoneRef = useRef(false);
+  const [videoDescription, setVideoDescription] = useState<string | null>(null);
+  const [isDescriptionExpanded, setIsDescriptionExpanded] = useState(false);
+
+  // Word definition lookup state
+  const [selectedWord, setSelectedWord] = useState<string | null>(null);
+  const [wordTranslation, setWordTranslation] = useState<TranslateResult | null>(null);
+  const [isTranslating, setIsTranslating] = useState(false);
+  const [isSavingWord, setIsSavingWord] = useState(false);
+  const [wordSaved, setWordSaved] = useState(false);
+  const [wordSegmentTimestamp, setWordSegmentTimestamp] = useState<number>(0);
+
+  // Connection state for streaming
+  const serverUrl = useConnectionStore((s) => s.serverUrl);
+  const isConnectedToDesktop = useConnectionStore((s) => s.serverUrl !== null);
+
+  // Playlist playback state
+  const playlistId = usePlaybackStore((s) => s.playlistId);
+  const playlistTitle = usePlaybackStore((s) => s.playlistTitle);
+  const playlistVideos = usePlaybackStore((s) => s.playlistVideos);
+  const currentIndex = usePlaybackStore((s) => s.currentIndex);
+  const playNext = usePlaybackStore((s) => s.playNext);
+  const playPrevious = usePlaybackStore((s) => s.playPrevious);
+  const clearPlaylist = usePlaybackStore((s) => s.clearPlaylist);
+  const hasNextVideo = usePlaybackStore((s) => s.hasNext());
+  const hasPreviousVideo = usePlaybackStore((s) => s.hasPrevious());
+  const setCurrentIndex = usePlaybackStore((s) => s.setCurrentIndex);
+  const streamServerUrl = usePlaybackStore((s) => s.streamServerUrl);
+  const getStreamUrl = usePlaybackStore((s) => s.getStreamUrl);
+
+  // Get video from playlist if streaming, otherwise from library
+  const playlistVideo = playlistVideos.find((v) => v.id === id);
+  const dbVideo = useMemo(() => {
+    if (!id) return undefined;
+    const storedVideo = videoRepo.getVideoById(id);
+    if (!storedVideo) return undefined;
+
+    return {
+      id: storedVideo.id,
+      title: storedVideo.title,
+      channelTitle: storedVideo.channelTitle,
+      duration: storedVideo.duration,
+      thumbnailUrl: storedVideo.thumbnailUrl ?? undefined,
+      localPath: storedVideo.localPath ?? undefined,
+    };
+  }, [id]);
+  const video = libraryVideo ?? playlistVideo ?? dbVideo;
+
+  // Determine video source URL - resolve path dynamically to handle sandbox changes
+  const localVideoPath = id ? getVideoLocalPath(id) : null;
+  const directStreamUrl =
+    !localVideoPath && serverUrl && id ? `${serverUrl}/api/video/${id}/file` : null;
+  const videoSourceUrl =
+    localVideoPath ??
+    (streamServerUrl && id ? getStreamUrl(id) : null) ??
+    directStreamUrl;
+
+  useEffect(() => {
+    watchAccumulatorRef.current = 0;
+    lastPlaybackTimeRef.current = 0;
+    lastPositionRef.current = 0;
+    lastPersistedAtRef.current = 0;
+    isPlayingRef.current = false;
+    initialSeekDoneRef.current = false;
+    visibleTranscriptRangeRef.current = { first: -1, last: -1 };
+    lastAutoScrollAtRef.current = 0;
+    lastAutoScrollIndexRef.current = -1;
+    userInteractingUntilRef.current = 0;
+    setCurrentTime(0);
+    setVideoDescription(null);
+    setIsDescriptionExpanded(false);
+  }, [id]);
+
+  // Sync playlist index when video ID changes
+  useEffect(() => {
+    if (playlistId && id) {
+      const index = playlistVideos.findIndex((v) => v.id === id);
+      if (index >= 0 && index !== currentIndex) {
+        setCurrentIndex(index);
+      }
+    }
+  }, [id, playlistId, playlistVideos, currentIndex, setCurrentIndex]);
+
+  // The effective server URL for fetching transcripts (desktop is source of truth)
+  const effectiveServerUrl = useMemo(
+    () => streamServerUrl || serverUrl || null,
+    [streamServerUrl, serverUrl]
+  );
+
+  useEffect(() => {
+    if (!id || !effectiveServerUrl) return;
+
+    let cancelled = false;
+    api
+      .getVideoMeta(effectiveServerUrl, id)
+      .then((meta) => {
+        if (cancelled) return;
+        const normalizedDescription = meta.description?.trim();
+        setVideoDescription(normalizedDescription ? normalizedDescription : null);
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          console.log("[Player] Failed to fetch description:", error);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [id, effectiveServerUrl]);
+
+  // Fetch transcript from desktop when connected (always, even for local videos)
+  useEffect(() => {
+    if (!id) return;
+    const url = streamServerUrl || serverUrl;
+    if (!url) {
+      console.log("[Player] No server URL available for transcript fetch", {
+        streamServerUrl,
+        serverUrl,
+      });
+      return;
+    }
+
+    console.log("[Player] Fetching transcript from desktop", { url, videoId: id });
+    setIsLoadingTranscript(true);
+    api
+      .getVideoTranscripts(url, id)
+      .then((transcripts) => {
+        console.log("[Player] Got transcripts:", transcripts.length);
+        if (transcripts.length > 0) {
+          // Use the first non-auto-generated transcript, or fall back to first available
+          const preferred =
+            transcripts.find((t) => !t.isAutoGenerated) ?? transcripts[0];
+          setStreamingTranscript(preferred ?? null);
+        } else {
+          setStreamingTranscript(null);
+        }
+      })
+      .catch((error) => {
+        console.log("[Player] Failed to fetch transcript from desktop:", error);
+        // Don't clear existing local transcript on failure
+      })
+      .finally(() => {
+        setIsLoadingTranscript(false);
+      });
+  }, [id, streamServerUrl, serverUrl]); // Changed dependency array
+
+  // Handle downloading transcript from desktop
+  const handleDownloadTranscript = useCallback(async () => {
+    const url = streamServerUrl || serverUrl;
+    if (!id) return;
+    if (!url) {
+      Alert.alert(
+        "Not Connected",
+        "Connect to your desktop app first to download transcripts.",
+        [{ text: "OK" }]
+      );
+      return;
+    }
+
+    setIsDownloadingTranscript(true);
+    try {
+      const result = await api.requestTranscriptDownload(url, id);
+      console.log("[Player] Transcript download result:", result);
+
+      if (result.success) {
+        // Poll for transcript availability
+        for (let attempt = 0; attempt < 5; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          try {
+            const transcripts = await api.getVideoTranscripts(url, id);
+            if (transcripts.length > 0) {
+              const preferred =
+                transcripts.find((t) => !t.isAutoGenerated) ?? transcripts[0];
+              setStreamingTranscript(preferred ?? null);
+              break;
+            }
+          } catch {
+            // Continue polling
+          }
+        }
+      } else {
+        Alert.alert(
+          "Download Failed",
+          result.message || "Could not download transcript",
+          [{ text: "OK" }]
+        );
+      }
+    } catch (error) {
+      console.log("[Player] Failed to request transcript download:", error);
+      Alert.alert(
+        "Download Failed",
+        "Could not connect to desktop to download transcript.",
+        [{ text: "OK" }]
+      );
+    } finally {
+      setIsDownloadingTranscript(false);
+    }
+  }, [id, streamServerUrl, serverUrl]); // Changed dependency array
+
+  // Handle word tap for definition lookup
+  const handleWordPress = useCallback(
+    async (word: string, segmentTimestamp: number) => {
+      const url = effectiveServerUrl;
+      if (!url || !id) return;
+
+      // Clean the word
+      const cleanWord = word.replace(/[.,!?;:()[\]'"…\-–—]/g, "").trim();
+      if (!cleanWord || cleanWord.length < 2) return;
+
+      setSelectedWord(cleanWord);
+      setWordTranslation(null);
+      setIsTranslating(true);
+      setWordSaved(false);
+      setWordSegmentTimestamp(segmentTimestamp);
+
+      try {
+        const targetLang = useSettingsStore.getState().translationTargetLang;
+        const result = await api.translateWord(url, cleanWord, targetLang, {
+          videoId: id,
+          timestampSeconds: segmentTimestamp,
+        });
+        setWordTranslation(result);
+      } catch (e) {
+        console.log("[Player] Translation failed:", e);
+        setWordTranslation(null);
+      } finally {
+        setIsTranslating(false);
+      }
+    },
+    [effectiveServerUrl, id]
+  );
+
+  // Handle saving a word
+  const handleSaveWord = useCallback(async () => {
+    const url = effectiveServerUrl;
+    if (!wordTranslation?.translationId || isSavingWord || !selectedWord) return;
+
+    setIsSavingWord(true);
+    let savedLocally = false;
+    let savedOnDesktop = false;
+
+    try {
+      // Save locally first so users can always see words in offline mode.
+      const targetLang = useSettingsStore.getState().translationTargetLang;
+      const localSavedWord = wordsRepo.saveTranslatedWordLocal({
+        translationId: wordTranslation.translationId,
+        sourceText: selectedWord,
+        translatedText: wordTranslation.translatedText,
+        sourceLang: wordTranslation.detectedLang || "auto",
+        targetLang,
+      });
+
+      savedLocally = !!localSavedWord;
+
+      // Best-effort desktop sync when connected.
+      if (url) {
+        const result = await api.saveWord(url, wordTranslation.translationId);
+        savedOnDesktop = result.success;
+      }
+
+      if (savedLocally || savedOnDesktop) {
+        setWordSaved(true);
+      } else {
+        Alert.alert("Error", "Could not save word");
+      }
+    } catch (e) {
+      console.log("[Player] Save word failed:", e);
+      if (!savedLocally && !savedOnDesktop) {
+        Alert.alert("Error", "Could not save word");
+      }
+    } finally {
+      setIsSavingWord(false);
+    }
+  }, [effectiveServerUrl, wordTranslation, isSavingWord, selectedWord]);
+
+  const closeWordModal = useCallback(() => {
+    setSelectedWord(null);
+    setWordTranslation(null);
+    setWordSaved(false);
+  }, []);
+
+  const persistWatchProgress = useCallback(
+    (positionSeconds: number, force = false) => {
+      if (!video?.id) return;
+
+      const now = Date.now();
+      const normalizedPosition = Math.max(0, Math.floor(positionSeconds));
+      const additionalWatchSeconds = Math.max(
+        0,
+        Math.floor(watchAccumulatorRef.current)
+      );
+
+      if (normalizedPosition <= 0 && additionalWatchSeconds <= 0) {
+        return;
+      }
+
+      if (!force && additionalWatchSeconds < 2) {
+        return;
+      }
+
+      if (!force && now - lastPersistedAtRef.current < 5000) {
+        return;
+      }
+
+      try {
+        watchHistoryRepo.upsertWatchProgress({
+          videoId: video.id,
+          title: video.title,
+          channelTitle: video.channelTitle,
+          duration: video.duration,
+          thumbnailUrl: video.thumbnailUrl ?? null,
+          localPath: localVideoPath ?? video.localPath ?? null,
+          lastPositionSeconds: normalizedPosition,
+          additionalWatchSeconds,
+          lastWatchedAt: now,
+        });
+        watchAccumulatorRef.current = 0;
+        lastPersistedAtRef.current = now;
+      } catch (error) {
+        console.log("[Player] Failed to persist watch progress:", error);
+      }
+    },
+    [video, localVideoPath]
+  );
+
+  // Only create player when we have a valid source to avoid Fabric viewState errors
+  // (mounting VideoView with an empty source can cause "Unable to find viewState for tag")
+  const player = useVideoPlayer(videoSourceUrl ?? "", (p) => {
+    p.loop = false;
+    p.timeUpdateEventInterval = 0.5;
+    p.staysActiveInBackground = true;
+    p.showNowPlayingNotification = true;
+    p.play();
+  });
+  const hasValidSource = Boolean(videoSourceUrl);
+
+  useEffect(() => {
+    if (!player || initialSeekDoneRef.current) return;
+
+    const startSeconds = Number(start ?? 0);
+    if (!Number.isFinite(startSeconds) || startSeconds <= 0) {
+      initialSeekDoneRef.current = true;
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      try {
+        player.currentTime = startSeconds;
+        setCurrentTime(startSeconds);
+        lastPlaybackTimeRef.current = startSeconds;
+        lastPositionRef.current = startSeconds;
+      } catch (error) {
+        console.log("[Player] Failed to seek to start time:", error);
+      } finally {
+        initialSeekDoneRef.current = true;
+      }
+    }, 250);
+
+    return () => clearTimeout(timeout);
+  }, [player, start]);
+
+  useEffect(() => {
+    if (!player) return;
+
+    const subscription = player.addListener("playingChange", (event) => {
+      setIsPlaying(event.isPlaying);
+      isPlayingRef.current = event.isPlaying;
+      if (!event.isPlaying) {
+        persistWatchProgress(lastPositionRef.current, true);
+      }
+    });
+
+    const timeSubscription = player.addListener(
+      "timeUpdate",
+      (event) => {
+        const nextTime = event.currentTime;
+        const previousTime = lastPlaybackTimeRef.current;
+        const delta = nextTime - previousTime;
+
+        if (isPlayingRef.current && delta > 0 && delta < 5) {
+          watchAccumulatorRef.current += delta;
+        }
+
+        lastPlaybackTimeRef.current = nextTime;
+        lastPositionRef.current = nextTime;
+        setCurrentTime(nextTime);
+
+        if (watchAccumulatorRef.current >= 5) {
+          persistWatchProgress(nextTime);
+        }
+      }
+    );
+
+    // Auto-advance to next video in playlist when current video ends
+    const endSubscription = player.addListener("playToEnd", () => {
+      const finalPosition = video?.duration ?? lastPositionRef.current;
+      lastPositionRef.current = finalPosition;
+      persistWatchProgress(finalPosition, true);
+
+      if (playlistId && hasNextVideo) {
+        const nextVideo = playNext();
+        if (nextVideo) {
+          router.replace(`/player/${nextVideo.id}`);
+        }
+      }
+    });
+
+    return () => {
+      persistWatchProgress(lastPositionRef.current, true);
+      subscription.remove();
+      timeSubscription.remove();
+      endSubscription.remove();
+    };
+  }, [player, playlistId, hasNextVideo, playNext, persistWatchProgress, video]);
+
+  const seekToSeconds = useCallback(
+    (seconds: number) => {
+      if (!player) return;
+      const seekTime = Math.max(0, seconds);
+      player.currentTime = seekTime;
+      setCurrentTime(seekTime);
+      lastPlaybackTimeRef.current = seekTime;
+      lastPositionRef.current = seekTime;
+    },
+    [player]
+  );
+
+  const handleSegmentPress = useCallback(
+    (segment: TranscriptSegment) => {
+      seekToSeconds(segment.start);
+    },
+    [seekToSeconds]
+  );
+
+  const handleBackPress = useCallback(() => {
+    persistWatchProgress(lastPositionRef.current, true);
+    // Clear playlist context when manually going back
+    if (playlistId) {
+      clearPlaylist();
+    }
+    router.back();
+  }, [playlistId, clearPlaylist, persistWatchProgress]);
+
+  const handlePreviousPress = useCallback(() => {
+    persistWatchProgress(lastPositionRef.current, true);
+    const prevVideo = playPrevious();
+    if (prevVideo) {
+      router.replace(`/player/${prevVideo.id}`);
+    }
+  }, [playPrevious, persistWatchProgress]);
+
+  const handleNextPress = useCallback(() => {
+    persistWatchProgress(lastPositionRef.current, true);
+    const nextVideo = playNext();
+    if (nextVideo) {
+      router.replace(`/player/${nextVideo.id}`);
+    }
+  }, [playNext, persistWatchProgress]);
+
+  // Use remote transcript if available, otherwise fall back to local
+  const transcript = streamingTranscript ?? libraryVideo?.transcript;
+
+  const getCurrentSegmentIndex = () => {
+    if (!transcript?.segments) return -1;
+    const time = currentTime;
+    for (let i = transcript.segments.length - 1; i >= 0; i--) { // Changed loop direction
+      if (time >= transcript.segments[i].start) return i;
+    }
+    return -1;
+  };
+
+  const currentSegmentIndex = getCurrentSegmentIndex();
+
+  const markUserScrolling = useCallback(() => {
+    userInteractingUntilRef.current = Date.now() + USER_SCROLL_HOLD_MS;
+  }, []);
+
+  const viewabilityConfig = useRef({
+    itemVisiblePercentThreshold: 45,
+  }).current;
+
+  const onViewableItemsChanged = useRef(
+    ({ viewableItems }: { viewableItems: ViewToken[] }) => {
+      const indexes = viewableItems
+        .map((item) => (typeof item.index === "number" ? item.index : -1))
+        .filter((index) => index >= 0);
+
+      if (indexes.length === 0) return;
+
+      visibleTranscriptRangeRef.current = {
+        first: Math.min(...indexes),
+        last: Math.max(...indexes),
+      };
+    }
+  ).current;
+
+  // Smarter transcript follow mode: only scroll when needed and not while user is manually scrolling.
+  useEffect(() => {
+    if (!isPlaying || currentSegmentIndex < 0 || !transcriptListRef.current) return;
+    if (Date.now() < userInteractingUntilRef.current) return;
+
+    const { first, last } = visibleTranscriptRangeRef.current;
+    const isRangeKnown = first >= 0 && last >= first;
+    const visibilityBuffer = 1;
+    const isCurrentLineVisible =
+      isRangeKnown &&
+      currentSegmentIndex >= first + visibilityBuffer &&
+      currentSegmentIndex <= last - visibilityBuffer;
+
+    if (isCurrentLineVisible) return;
+
+    const now = Date.now();
+    if (
+      now - lastAutoScrollAtRef.current < AUTO_SCROLL_THROTTLE_MS &&
+      Math.abs(currentSegmentIndex - lastAutoScrollIndexRef.current) < 2
+    ) {
+      return;
+    }
+
+    try {
+      transcriptListRef.current.scrollToIndex({
+        index: currentSegmentIndex,
+        animated: true,
+        viewPosition: 0.45,
+      });
+      lastAutoScrollAtRef.current = now;
+      lastAutoScrollIndexRef.current = currentSegmentIndex;
+    } catch {
+      // Ignore - onScrollToIndexFailed handles retries.
+    }
+  }, [currentSegmentIndex, isPlaying]);
+
+  const handleScrollToIndexFailed = useCallback(
+    (info: {
+      index: number;
+      highestMeasuredFrameIndex: number;
+      averageItemLength: number;
+    }) => {
+      if (!transcriptListRef.current || info.index < 0) return;
+
+      const fallbackOffset = Math.max(0, info.averageItemLength * info.index - info.averageItemLength);
+      transcriptListRef.current.scrollToOffset({ offset: fallbackOffset, animated: true });
+
+      setTimeout(() => {
+        if (!transcriptListRef.current) return;
+        try {
+          transcriptListRef.current.scrollToIndex({
+            index: Math.min(info.index, info.highestMeasuredFrameIndex),
+            animated: true,
+            viewPosition: 0.45,
+          });
+        } catch {
+          // Ignore retry errors.
+        }
+      }, 120);
+    },
+    []
+  );
+
+  // Render tappable words in a segment
+  const renderTappableSegment = useCallback(
+    (text: string, segmentStart: number, isActive: boolean) => {
+      if (!isConnectedToDesktop) {
+        return <Text style={[styles.segmentText, isActive && styles.segmentTextActive]}>{text}</Text>;
+      }
+
+      const words = text.split(/(\s+)/);
+      return (
+        <Text style={[styles.segmentText, isActive && styles.segmentTextActive]}>
+          {words.map((word, i) => {
+            if (/^\s+$/.test(word)) {
+              return word; // Return whitespace as-is
+            }
+            return (
+              <Text
+                key={i}
+                style={[styles.tappableWord, isActive && styles.tappableWordActive]}
+                onPress={() => handleWordPress(word, segmentStart)}
+              >
+                {word}
+              </Text>
+            );
+          })}
+        </Text>
+      );
+    },
+    [isConnectedToDesktop, handleWordPress]
+  );
+
+  if (!video) { // Changed condition
+    return (
+      <View style={[styles.container, { paddingTop: insets.top }]}>
+        <Pressable
+          style={styles.backButton}
+          onPress={() => {
+            clearPlaylist(); // Added clearPlaylist
+            router.back();
+          }}
+        >
+          <Text style={styles.backButtonText}>← Back</Text>
+        </Pressable>
+        <View style={styles.noTranscript}>
+          <Text style={styles.errorText}>Video not found</Text>
+        </View>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.container}>
+      <View style={[styles.header, { paddingTop: insets.top }]}>
+        <View style={styles.headerRow}>
+          <Pressable
+            onPress={handleBackPress}
+            style={styles.backButton}
+          >
+            <Text style={styles.backButtonText}>← Back</Text>
+          </Pressable>
+          {playlistId && (
+            <View style={styles.playlistControls}>
+              <Pressable
+                style={[
+                  styles.navButton,
+                  !hasPreviousVideo && styles.navButtonDisabled,
+                ]}
+                onPress={handlePreviousPress}
+                disabled={!hasPreviousVideo}
+              >
+                <Text
+                  style={[
+                    styles.navButtonText,
+                    !hasPreviousVideo && styles.navButtonTextDisabled,
+                  ]}
+                >
+                  ⏮
+                </Text>
+              </Pressable>
+              <Pressable
+                style={[
+                  styles.navButton,
+                  !hasNextVideo && styles.navButtonDisabled,
+                ]}
+                onPress={handleNextPress}
+                disabled={!hasNextVideo}
+              >
+                <Text
+                  style={[
+                    styles.navButtonText,
+                    !hasNextVideo && styles.navButtonTextDisabled,
+                  ]}
+                >
+                  ⏭
+                </Text>
+              </Pressable>
+            </View>
+          )}
+        </View>
+        {playlistId && playlistTitle && (
+          <View style={styles.playlistIndicator}>
+            <Text style={styles.playlistIndicatorText}>
+              Playing {currentIndex + 1} of {playlistVideos.length} • {playlistTitle}
+            </Text>
+          </View>
+        )}
+      </View>
+
+      {hasValidSource ? (
+        <VideoView player={player} style={styles.video} />
+      ) : (
+        <View style={[styles.video, styles.videoPlaceholder]}>
+          <ActivityIndicator size="large" color="#e94560" />
+          <Text style={styles.videoPlaceholderText}>Loading video...</Text>
+        </View>
+      )}
+
+      <View style={styles.infoContainer}>
+        <Text style={styles.title} numberOfLines={2}>
+          {video.title}
+        </Text>
+        <View style={styles.channelRow}>
+          <Text style={styles.channel}>{video.channelTitle}</Text>
+          {!localVideoPath && effectiveServerUrl && (
+            <View style={styles.streamingBadge}>
+              <Text style={styles.streamingBadgeText}>Streaming</Text>
+            </View>
+          )}
+        </View>
+      </View>
+
+      {videoDescription && (
+        <View style={styles.descriptionContainer}>
+          <Pressable
+            style={styles.descriptionToggle}
+            onPress={() => setIsDescriptionExpanded((prev) => !prev)}
+          >
+            <Text style={styles.descriptionToggleLabel}>Video Description</Text>
+            <Text style={styles.descriptionToggleIcon}>{isDescriptionExpanded ? "▾" : "▸"}</Text>
+          </Pressable>
+
+          {isDescriptionExpanded && (
+            <View style={styles.descriptionBody}>
+              <Text style={styles.descriptionHint}>Tap a timestamp to seek</Text>
+              <ScrollView style={styles.descriptionScroll} nestedScrollEnabled>
+                <Text style={styles.descriptionText}>
+                  {renderDescriptionWithTimestamps(videoDescription, seekToSeconds)}
+                </Text>
+              </ScrollView>
+            </View>
+          )}
+        </View>
+      )}
+
+      {isLoadingTranscript ? (
+        <View style={[styles.noTranscript, { paddingBottom: insets.bottom }]}>
+          <Text style={styles.noTranscriptText}>Loading transcript...</Text>
+        </View>
+      ) : transcript?.segments && transcript.segments.length > 0 ? (
+        <View style={styles.transcriptContainer}>
+          <View style={styles.transcriptHeaderRow}>
+            <Text style={styles.transcriptHeader}>Transcript</Text>
+            {isConnectedToDesktop && (
+              <Text style={styles.tapHintText}>Tap a word to translate</Text>
+            )}
+          </View>
+          <FlatList
+            ref={transcriptListRef}
+            data={transcript.segments}
+            keyExtractor={(_, index) => index.toString()}
+            onViewableItemsChanged={onViewableItemsChanged}
+            viewabilityConfig={viewabilityConfig}
+            onScrollToIndexFailed={handleScrollToIndexFailed}
+            onScrollBeginDrag={markUserScrolling}
+            onMomentumScrollBegin={markUserScrolling}
+            onMomentumScrollEnd={markUserScrolling}
+            contentContainerStyle={{ paddingBottom: insets.bottom }}
+            initialNumToRender={20}
+            maxToRenderPerBatch={10}
+            windowSize={10}
+            renderItem={({ item, index }) => (
+              <Pressable
+                style={[
+                  styles.segment,
+                  index === currentSegmentIndex && styles.segmentActive,
+                ]}
+                onPress={() => handleSegmentPress(item)}
+              >
+                <Text style={styles.segmentTime}>
+                  {formatTime(item.start)}
+                </Text>
+                <View style={{ flex: 1 }}>
+                  {renderTappableSegment(item.text, item.start, index === currentSegmentIndex)}
+                </View>
+              </Pressable>
+            )}
+          />
+        </View>
+      ) : (
+        <View style={[styles.noTranscript, { paddingBottom: insets.bottom }]}>
+          <Text style={styles.noTranscriptText}>
+            No transcript available for this video
+          </Text>
+          <Pressable
+            style={[
+              styles.downloadTranscriptButton,
+              isDownloadingTranscript && styles.downloadTranscriptButtonDisabled,
+            ]}
+            onPress={handleDownloadTranscript}
+            disabled={isDownloadingTranscript}
+          >
+            {isDownloadingTranscript ? (
+              <>
+                <ActivityIndicator size="small" color="#fff" />
+                <Text style={styles.downloadTranscriptButtonText}>
+                  Downloading...
+                </Text>
+              </>
+            ) : (
+              <Text style={styles.downloadTranscriptButtonText}>
+                Download Transcript from Desktop
+              </Text>
+            )}
+          </Pressable>
+        </View>
+      )}
+
+      {/* Word Definition Modal */}
+      <Modal
+        visible={selectedWord !== null}
+        transparent
+        animationType="slide"
+        onRequestClose={closeWordModal}
+      >
+        <Pressable
+          style={styles.modalOverlay}
+          onPress={closeWordModal}
+        >
+          <View style={styles.modalContent} onStartShouldSetResponder={() => true}>
+            <View style={styles.modalHandle} />
+            <Text style={styles.modalWord}>{selectedWord}</Text>
+
+            {isTranslating ? (
+              <View style={styles.modalLoadingContainer}>
+                <ActivityIndicator size="small" color="#e94560" />
+                <Text style={styles.modalLoadingText}>Translating...</Text>
+              </View>
+            ) : wordTranslation?.success ? (
+              <>
+                <Text style={styles.modalTranslation}>
+                  {wordTranslation.translatedText}
+                </Text>
+                {wordTranslation.detectedLang && (
+                  <Text style={styles.modalLang}>
+                    Detected: {wordTranslation.detectedLang}
+                  </Text>
+                )}
+
+                {wordSaved ? (
+                  <View style={styles.savedBadge}>
+                    <Text style={styles.savedBadgeText}>✓ Saved to My Words</Text>
+                  </View>
+                ) : (
+                  <Pressable
+                    style={styles.saveWordButton}
+                    onPress={handleSaveWord}
+                    disabled={isSavingWord}
+                  >
+                    {isSavingWord ? (
+                      <ActivityIndicator size="small" color="#fff" />
+                    ) : (
+                      <Text style={styles.saveWordButtonText}>
+                        + Save to My Words
+                      </Text>
+                    )}
+                  </Pressable>
+                )}
+              </>
+            ) : (
+              <Text style={styles.modalError}>
+                Could not translate this word
+              </Text>
+            )}
+
+            <Pressable style={styles.modalCloseButton} onPress={closeWordModal}>
+              <Text style={styles.modalCloseButtonText}>Close</Text>
+            </Pressable>
+          </View>
+        </Pressable>
+      </Modal>
+    </View>
+  );
+}
+
+function formatTime(seconds: number): string {
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: "#0f0f23",
+  },
+  header: {
+    backgroundColor: "#0f0f23",
+  },
+  headerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  backButton: {
+    padding: 16,
+  },
+  backButtonText: {
+    color: "#fff",
+    fontSize: 16,
+    fontWeight: "500",
+  },
+  playlistControls: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingRight: 12,
+    gap: 8,
+  },
+  navButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: "#1a1a2e",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  navButtonDisabled: {
+    backgroundColor: "#0f0f23",
+  },
+  navButtonText: {
+    fontSize: 18,
+  },
+  navButtonTextDisabled: {
+    opacity: 0.3,
+  },
+  playlistIndicator: {
+    paddingHorizontal: 16,
+    paddingBottom: 8,
+  },
+  playlistIndicatorText: {
+    color: "#e94560",
+    fontSize: 12,
+    fontWeight: "500",
+  },
+  video: {
+    width: SCREEN_WIDTH,
+    height: VIDEO_HEIGHT,
+    backgroundColor: "#000",
+  },
+  videoPlaceholder: {
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  videoPlaceholderText: {
+    color: "#8f9cc7",
+    fontSize: 14,
+    marginTop: 12,
+  },
+  infoContainer: {
+    padding: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: "#1a1a2e",
+  },
+  descriptionContainer: {
+    borderBottomWidth: 1,
+    borderBottomColor: "#1a1a2e",
+    backgroundColor: "#11152b",
+  },
+  descriptionToggle: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  descriptionToggleLabel: {
+    color: "#c6d0f5",
+    fontSize: 13,
+    fontWeight: "600",
+  },
+  descriptionToggleIcon: {
+    color: "#8f9cc7",
+    fontSize: 16,
+    fontWeight: "700",
+  },
+  descriptionBody: {
+    paddingHorizontal: 16,
+    paddingBottom: 12,
+  },
+  descriptionHint: {
+    color: "#7a86b1",
+    fontSize: 11,
+    marginBottom: 6,
+  },
+  descriptionScroll: {
+    maxHeight: 180,
+    backgroundColor: "#0f1328",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  descriptionText: {
+    color: "#a8b1d1",
+    fontSize: 13,
+    lineHeight: 19,
+  },
+  descriptionTimestamp: {
+    color: "#86b7ff",
+    textDecorationLine: "underline",
+  },
+  title: {
+    color: "#fff",
+    fontSize: 16,
+    fontWeight: "600",
+    marginBottom: 4,
+  },
+  channel: {
+    color: "#a0a0a0",
+    fontSize: 14,
+  },
+  channelRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  streamingBadge: {
+    backgroundColor: "#9333ea",
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 10,
+  },
+  streamingBadgeText: {
+    color: "#fff",
+    fontSize: 11,
+    fontWeight: "600",
+  },
+  transcriptContainer: {
+    flex: 1,
+    backgroundColor: "#16213e",
+  },
+  transcriptHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: "#1a1a2e",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  transcriptHeader: {
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  tapHintText: {
+    color: "#666",
+    fontSize: 11,
+    fontStyle: "italic",
+  },
+  segment: {
+    flexDirection: "row",
+    padding: 12,
+    minHeight: SEGMENT_HEIGHT,
+    borderBottomWidth: 1,
+    borderBottomColor: "#1a1a2e",
+  },
+  segmentActive: {
+    backgroundColor: "#1a1a2e",
+  },
+  segmentTime: {
+    color: "#e94560",
+    fontSize: 12,
+    fontWeight: "500",
+    width: 45,
+    marginRight: 12,
+  },
+  segmentText: {
+    flex: 1,
+    color: "#a0a0a0",
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  segmentTextActive: {
+    color: "#fff",
+  },
+  tappableWord: {
+    color: "#a0a0a0",
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  tappableWordActive: {
+    color: "#fff",
+  },
+  noTranscript: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 20,
+  },
+  noTranscriptText: {
+    color: "#666",
+    fontSize: 14,
+    marginBottom: 16,
+  },
+  downloadTranscriptButton: {
+    backgroundColor: "#e94560",
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    borderRadius: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginTop: 8,
+  },
+  downloadTranscriptButtonDisabled: {
+    backgroundColor: "#555",
+  },
+  downloadTranscriptButtonText: {
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  errorText: {
+    color: "#e94560",
+    fontSize: 16,
+    textAlign: "center",
+    marginTop: 100,
+  },
+  // Word definition modal styles
+  modalOverlay: {
+    flex: 1,
+    justifyContent: "flex-end",
+    backgroundColor: "rgba(0, 0, 0, 0.5)",
+  },
+  modalContent: {
+    backgroundColor: "#16213e",
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    padding: 24,
+    paddingBottom: 40,
+    alignItems: "center",
+    minHeight: 250,
+  },
+  modalHandle: {
+    width: 40,
+    height: 4,
+    backgroundColor: "#333",
+    borderRadius: 2,
+    marginBottom: 20,
+  },
+  modalWord: {
+    color: "#fff",
+    fontSize: 28,
+    fontWeight: "bold",
+    marginBottom: 16,
+    textAlign: "center",
+  },
+  modalTranslation: {
+    color: "#e94560",
+    fontSize: 22,
+    fontWeight: "600",
+    marginBottom: 8,
+    textAlign: "center",
+  },
+  modalLang: {
+    color: "#666",
+    fontSize: 12,
+    marginBottom: 20,
+  },
+  modalLoadingContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginVertical: 20,
+  },
+  modalLoadingText: {
+    color: "#a0a0a0",
+    fontSize: 14,
+  },
+  modalError: {
+    color: "#666",
+    fontSize: 14,
+    marginVertical: 20,
+  },
+  saveWordButton: {
+    backgroundColor: "#059669",
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    borderRadius: 8,
+    marginTop: 8,
+    minWidth: 160,
+    alignItems: "center",
+  },
+  saveWordButtonText: {
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  savedBadge: {
+    backgroundColor: "rgba(5, 150, 105, 0.15)",
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 8,
+    marginTop: 8,
+  },
+  savedBadgeText: {
+    color: "#059669",
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  modalCloseButton: {
+    marginTop: 20,
+    paddingVertical: 10,
+    paddingHorizontal: 30,
+  },
+  modalCloseButtonText: {
+    color: "#666",
+    fontSize: 14,
+  },
+});

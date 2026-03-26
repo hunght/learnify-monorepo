@@ -1,0 +1,224 @@
+import { z } from "zod";
+import { publicProcedure, t } from "@/api/trpc";
+import { logger } from "@/helpers/logger";
+import { eq, desc, inArray, sql } from "drizzle-orm";
+import { youtubeVideos, videoWatchStats } from "@/api/db/schema";
+import defaultDb from "@/api/db";
+
+// Return types for watch-stats router
+type RecordProgressSuccess = {
+  success: true;
+};
+
+type RecordProgressFailure = {
+  success: false;
+};
+
+type RecordProgressResult = RecordProgressSuccess | RecordProgressFailure;
+
+type WatchedVideoWithStats = {
+  id: string;
+  videoId: string;
+  title: string;
+  description: string | null;
+  channelId: string | null;
+  channelTitle: string;
+  thumbnailUrl: string | null;
+  thumbnailPath: string | null;
+  durationSeconds: number | null;
+  viewCount: number | null;
+  publishedAt: number | null;
+  totalWatchSeconds: number | null;
+  lastPositionSeconds: number | null;
+  lastWatchedAt: number;
+};
+
+type ListRecentWatchedResult = WatchedVideoWithStats[];
+
+type RecentVideoInfo = {
+  id: string;
+  videoId: string;
+  title: string;
+  description: string | null;
+  channelId: string | null;
+  channelTitle: string;
+  thumbnailUrl: string | null;
+  thumbnailPath: string | null;
+  durationSeconds: number | null;
+  viewCount: number | null;
+  publishedAt: number | null;
+  downloadStatus: string | null;
+  downloadProgress: number | null;
+  downloadFilePath: string | null;
+};
+
+type ListRecentVideosResult = RecentVideoInfo[];
+
+export const watchStatsRouter = t.router({
+  // Record watch progress (accumulated seconds and last position)
+  recordProgress: publicProcedure
+    .input(
+      z.object({
+        videoId: z.string(),
+        deltaSeconds: z.number().min(0).max(3600),
+        positionSeconds: z.number().min(0).optional(),
+      })
+    )
+    .mutation(async ({ input, ctx }): Promise<RecordProgressResult> => {
+      const db = ctx.db ?? defaultDb;
+      const now = Date.now();
+      try {
+        const existing = await db
+          .select()
+          .from(videoWatchStats)
+          .where(eq(videoWatchStats.videoId, input.videoId))
+          .limit(1);
+
+        if (existing.length === 0) {
+          await db.insert(videoWatchStats).values({
+            id: crypto.randomUUID(),
+            videoId: input.videoId,
+            totalWatchSeconds: Math.floor(input.deltaSeconds),
+            lastPositionSeconds: Math.floor(input.positionSeconds ?? 0),
+            lastWatchedAt: now,
+            createdAt: now,
+            updatedAt: now,
+          });
+        } else {
+          const prev = existing[0];
+          await db
+            .update(videoWatchStats)
+            .set({
+              totalWatchSeconds: Math.max(
+                0,
+                (prev.totalWatchSeconds ?? 0) + Math.floor(input.deltaSeconds)
+              ),
+              lastPositionSeconds: Math.floor(
+                input.positionSeconds ?? prev.lastPositionSeconds ?? 0
+              ),
+              lastWatchedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(videoWatchStats.videoId, input.videoId));
+        }
+        return { success: true };
+      } catch (e) {
+        logger.error("[watch-stats] recordProgress failed", e);
+        return { success: false };
+      }
+    }),
+
+  // List recently watched videos joined with metadata
+  listRecentWatched: publicProcedure
+    .input(
+      z
+        .object({
+          limit: z.number().min(1).max(200).optional(),
+          offset: z.number().min(0).optional(),
+        })
+        .optional()
+    )
+    .query(async ({ input, ctx }): Promise<ListRecentWatchedResult> => {
+      const db = ctx.db ?? defaultDb;
+      const limit = input?.limit ?? 30;
+      const offset = input?.offset ?? 0;
+      // Get recent watch stats
+      const stats = await db
+        .select()
+        .from(videoWatchStats)
+        .orderBy(desc(videoWatchStats.lastWatchedAt))
+        .limit(limit)
+        .offset(offset);
+
+      const videoIds = stats.map((s) => s.videoId);
+      if (videoIds.length === 0) return [];
+
+      const vids = await db
+        .select()
+        .from(youtubeVideos)
+        .where(inArray(youtubeVideos.videoId, videoIds));
+
+      const map = new Map<string, (typeof vids)[0]>();
+      vids.forEach((v) => map.set(v.videoId, v));
+      return stats
+        .map((s) => {
+          const v = map.get(s.videoId);
+          if (!v) return null;
+          return {
+            id: v.id,
+            videoId: v.videoId,
+            title: v.title,
+            description: v.description,
+            channelId: v.channelId,
+            channelTitle: v.channelTitle,
+            thumbnailUrl: v.thumbnailUrl,
+            thumbnailPath: v.thumbnailPath,
+            durationSeconds: v.durationSeconds,
+            viewCount: v.viewCount,
+            publishedAt: v.publishedAt,
+            totalWatchSeconds: s.totalWatchSeconds,
+            lastPositionSeconds: s.lastPositionSeconds,
+            lastWatchedAt: s.lastWatchedAt,
+          };
+        })
+        .filter((v): v is WatchedVideoWithStats => v !== null);
+    }),
+
+  // List videos by most recently added, balanced across channels (round-robin)
+  listRecentVideos: publicProcedure
+    .input(
+      z
+        .object({
+          limit: z.number().min(1).max(200).optional(),
+          offset: z.number().min(0).optional(),
+        })
+        .optional()
+    )
+    .query(async ({ input, ctx }): Promise<ListRecentVideosResult> => {
+      const db = ctx.db ?? defaultDb;
+      const limit = input?.limit ?? 200;
+      const offset = input?.offset ?? 0;
+
+      // Round-robin approach: order by rank first, then by created_at within each rank
+      // This gives us: 1st video from each channel, then 2nd from each, then 3rd, etc.
+      // until we hit the limit - ensuring fair distribution across all channels
+      const rows = await db.all<{
+        id: string;
+        videoId: string;
+        title: string;
+        description: string | null;
+        channelId: string | null;
+        channelTitle: string;
+        thumbnailUrl: string | null;
+        thumbnailPath: string | null;
+        durationSeconds: number | null;
+        viewCount: number | null;
+        publishedAt: number | null;
+        downloadStatus: string | null;
+        downloadProgress: number | null;
+        downloadFilePath: string | null;
+      }>(sql`
+        WITH ranked_videos AS (
+          SELECT 
+            *,
+            ROW_NUMBER() OVER (PARTITION BY channel_id ORDER BY created_at DESC) as rn
+          FROM youtube_videos
+          WHERE channel_id IS NOT NULL
+        )
+        SELECT 
+          id, video_id as videoId, title, description,
+          channel_id as channelId, channel_title as channelTitle,
+          thumbnail_url as thumbnailUrl, thumbnail_path as thumbnailPath,
+          duration_seconds as durationSeconds, view_count as viewCount,
+          published_at as publishedAt, download_status as downloadStatus,
+          download_progress as downloadProgress, download_file_path as downloadFilePath
+        FROM ranked_videos
+        ORDER BY rn ASC, created_at DESC
+        LIMIT ${limit} OFFSET ${offset}
+      `);
+
+      return rows;
+    }),
+});
+
+// Router type not exported (unused)
