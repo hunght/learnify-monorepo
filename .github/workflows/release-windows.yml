@@ -70,3 +70,4 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           draft: ${{ steps.release_meta.outputs.draft == 'true' }}
           prerelease: ${{ steps.release_meta.outputs.prerelease == 'true' }}
+          overwrite: true
