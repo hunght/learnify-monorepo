@@ -22,6 +22,8 @@ android/build/
 
 .env
 .env.local
+.secrets.env
+*.secrets.env
 .env.production.local
 .env.development.local
 
